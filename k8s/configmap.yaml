@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: order-management-config
+data:
+  DB_USER: "postgres"
+  DB_HOST: "replace-with-rds-endpoint"
+  DB_PORT: "5432"
+  DB_NAME: "order_management"
+
+  AWS_REGION: "us-east-1"
+
+  FULFILLMENT_API_URL: "replace-with-fulfillment-api-url"

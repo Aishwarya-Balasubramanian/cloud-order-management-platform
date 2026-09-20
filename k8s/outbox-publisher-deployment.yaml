@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-management-outbox-publisher
+
+spec:
+  replicas: 1
+
+  selector:
+    matchLabels:
+      app: order-management-outbox-publisher
+
+  template:
+    metadata:
+      labels:
+        app: order-management-outbox-publisher
+
+    spec:
+      containers:
+        - name: outbox-publisher
+          image: ORDER_MANAGEMENT_IMAGE
+
+          command:
+            - python
+            - -m
+            - app.workers.outbox_publisher
+
+          envFrom:
+            - configMapRef:
+                name: order-management-config
+
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: order-management-secrets
+                  key: DB_PASSWORD
+
+            - name: ORDER_QUEUE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: order-management-secrets
+                  key: ORDER_QUEUE_URL
+
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+
+            limits:
+              cpu: "250m"
+              memory: "256Mi"

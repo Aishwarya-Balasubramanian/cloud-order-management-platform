@@ -1,0 +1,86 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: order_management
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U postgres -d order_management"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    environment:
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: order_management
+      JWT_SECRET: ${JWT_SECRET:-local-development-secret-change-me-123456}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      ORDER_QUEUE_URL: ${ORDER_QUEUE_URL:-}
+      FULFILLMENT_API_URL: ${FULFILLMENT_API_URL:-http://host.docker.internal:9000}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  outbox-publisher:
+    build: .
+    command:
+      [
+        "python",
+        "-m",
+        "app.workers.outbox_publisher"
+      ]
+    profiles:
+      - async
+    environment:
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: order_management
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      ORDER_QUEUE_URL: ${ORDER_QUEUE_URL:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  order-worker:
+    build: .
+    command:
+      [
+        "python",
+        "-m",
+        "app.workers.order_worker"
+      ]
+    profiles:
+      - async
+    environment:
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: order_management
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      ORDER_QUEUE_URL: ${ORDER_QUEUE_URL:-}
+      FULFILLMENT_API_URL: ${FULFILLMENT_API_URL:-http://host.docker.internal:9000}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

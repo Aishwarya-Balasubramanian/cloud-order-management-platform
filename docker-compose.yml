@@ -19,6 +19,20 @@ services:
       timeout: 5s
       retries: 10
 
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: order_management
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   api:
     build: .
     environment:
@@ -34,17 +48,12 @@ services:
     ports:
       - "8000:8000"
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   outbox-publisher:
     build: .
-    command:
-      [
-        "python",
-        "-m",
-        "app.workers.outbox_publisher"
-      ]
+    command: ["python", "-m", "app.workers.outbox_publisher"]
     profiles:
       - async
     environment:
@@ -56,17 +65,12 @@ services:
       AWS_REGION: ${AWS_REGION:-us-east-1}
       ORDER_QUEUE_URL: ${ORDER_QUEUE_URL:-}
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   order-worker:
     build: .
-    command:
-      [
-        "python",
-        "-m",
-        "app.workers.order_worker"
-      ]
+    command: ["python", "-m", "app.workers.order_worker"]
     profiles:
       - async
     environment:
@@ -79,8 +83,8 @@ services:
       ORDER_QUEUE_URL: ${ORDER_QUEUE_URL:-}
       FULFILLMENT_API_URL: ${FULFILLMENT_API_URL:-http://host.docker.internal:9000}
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
 volumes:
   postgres_data:

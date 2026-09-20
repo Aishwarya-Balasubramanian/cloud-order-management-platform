@@ -1,4 +1,4 @@
-name: CI
+name: Validate application and infrastructure
 
 on:
   push:
@@ -6,13 +6,35 @@ on:
       - main
 
   pull_request:
+    branches:
+      - main
 
 jobs:
-  test-and-build:
+  test-and-validate:
     runs-on: ubuntu-latest
 
     env:
       JWT_SECRET: ci-test-secret-at-least-32-characters-long
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_NAME: order_management
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: order_management
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d order_management"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
 
     steps:
       - name: Checkout repository
@@ -23,16 +45,33 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      - name: Run tests
+      - name: Apply database migrations
+        run: alembic upgrade head
+
+      - name: Run automated tests
         run: python -m pytest -v
 
       - name: Build Docker image
-        run: |
-          docker build \
-            -t order-management-api:${{ github.sha }} \
-            .
+        run: docker build -t order-management-api:${{ github.sha }} .
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.2"
+
+      - name: Terraform format check
+        working-directory: infra/terraform
+        run: terraform fmt -check -recursive
+
+      - name: Terraform initialize
+        working-directory: infra/terraform
+        run: terraform init -backend=false
+
+      - name: Terraform validate
+        working-directory: infra/terraform
+        run: terraform validate

@@ -1,153 +1,77 @@
-from decimal import Decimal
-from unittest.mock import MagicMock, patch
+import json
+from unittest.mock import MagicMock
 
 import pytest
-import json
+
 from app.integrations.fulfillment_client import RetryableFulfillmentError
-from app.models.models import Order, ProcessedEvent
-from app.workers.order_worker import process_message
+from app.workers import order_worker
 
 
-def make_message():
+def make_message(
+    event_id="event-123",
+    event_type="OrderCreated",
+    order_number="ORD-001",
+):
     return {
-        "Body": """
-        {
-            "event_id": "11111111-1111-1111-1111-111111111111",
-            "event_type": "OrderCreated",
-            "order_number": "ORD-TEST-001",
-            "customer_id": 1,
-            "total_amount": "50.00"
-        }
-        """
+        "Body": json.dumps(
+            {
+                "event_id": event_id,
+                "event_type": event_type,
+                "order_number": order_number,
+            }
+        )
     }
 
 
-def make_order():
-    return Order(
-        id=1,
-        order_number="ORD-TEST-001",
-        customer_id=1,
-        status="PENDING",
-        total_amount=Decimal("50.00"),
-    )
-
-
-@patch("app.workers.order_worker.SessionLocal")
-def test_duplicate_event_skips_fulfillment(mock_session_local):
-    db = MagicMock()
-    mock_session_local.return_value = db
-
-    existing_event = ProcessedEvent(
-        event_id="11111111-1111-1111-1111-111111111111",
-        event_type="OrderCreated",
-    )
-
-    db.scalar.return_value = existing_event
-
-    with patch(
-        "app.workers.order_worker.FulfillmentClient"
-    ) as mock_client:
-        process_message(make_message())
-
-        mock_client.assert_not_called()
-
-    db.commit.assert_not_called()
-
-
-@patch("app.workers.order_worker.SessionLocal")
-def test_successful_event_records_processed_event(
-    mock_session_local,
-):
-    db = MagicMock()
-    mock_session_local.return_value = db
-
-    order = make_order()
-
-    # First scalar(): processed-event lookup.
-    # Second scalar(): order lookup.
-    db.scalar.side_effect = [
-        None,
-        order,
-    ]
-
-    with patch(
-        "app.workers.order_worker.FulfillmentClient"
-    ) as mock_client_class:
-        mock_client = mock_client_class.return_value
-
-        process_message(make_message())
-
-        mock_client.create_fulfillment.assert_called_once_with(
-            order
-        )
-
-    assert order.status == "CONFIRMED"
-
-    db.add.assert_called_once()
-
-    processed_event = db.add.call_args.args[0]
-
-    assert isinstance(processed_event, ProcessedEvent)
-
-    assert (
-        processed_event.event_id
-        == "11111111-1111-1111-1111-111111111111"
-    )
-
-    assert processed_event.event_type == "OrderCreated"
-
-    db.commit.assert_called_once()
-
-
-@patch("app.workers.order_worker.SessionLocal")
-def test_fulfillment_failure_does_not_mark_processed(
-    mock_session_local,
-):
-    db = MagicMock()
-    mock_session_local.return_value = db
-
-    order = make_order()
-
-    db.scalar.side_effect = [
-        None,
-        order,
-    ]
-
-    with patch(
-        "app.workers.order_worker.FulfillmentClient"
-    ) as mock_client_class:
-        mock_client = mock_client_class.return_value
-
-        mock_client.create_fulfillment.side_effect = (
-            RetryableFulfillmentError(
-                "Fulfillment service unavailable"
-            )
-        )
-
-        with pytest.raises(RetryableFulfillmentError):
-            process_message(make_message())
-
-    assert order.status == "PENDING"
-
-    db.add.assert_not_called()
-    db.commit.assert_not_called()
-    db.rollback.assert_called_once()
-
-
-def test_non_pending_order_does_not_call_fulfillment(monkeypatch):
-    from unittest.mock import MagicMock
-
-    from app.workers import order_worker
-
+def make_order(status="PENDING"):
     order = MagicMock()
     order.id = 1
-    order.order_number = "ORD-TEST-001"
-    order.status = "CONFIRMED"
+    order.order_number = "ORD-001"
+    order.status = status
+    return order
 
+
+def test_duplicate_event_skips_fulfillment(monkeypatch):
     db = MagicMock()
 
-    # First scalar(): ProcessedEvent lookup -> not processed
-    # Second scalar(): Order lookup -> existing CONFIRMED order
+    processed_event = MagicMock()
+
+    # First scalar call checks ProcessedEvent.
+    db.scalar.return_value = processed_event
+
+    monkeypatch.setattr(
+        order_worker,
+        "SessionLocal",
+        lambda: db,
+    )
+
+    fulfillment = MagicMock()
+
+    monkeypatch.setattr(
+        order_worker,
+        "FulfillmentClient",
+        lambda *_args, **_kwargs: fulfillment,
+    )
+
+    order_worker.process_message(
+        make_message()
+    )
+
+    fulfillment.create_fulfillment.assert_not_called()
+    db.commit.assert_not_called()
+    db.close.assert_called_once()
+
+
+def test_successful_event_records_processed_event(monkeypatch):
+    db = MagicMock()
+
+    order = make_order(status="PENDING")
+
+    # First scalar:
+    #   ProcessedEvent lookup -> None
+    #
+    # Second scalar:
+    #   Order lookup -> order
     db.scalar.side_effect = [
         None,
         order,
@@ -164,23 +88,113 @@ def test_non_pending_order_does_not_call_fulfillment(monkeypatch):
     monkeypatch.setattr(
         order_worker,
         "FulfillmentClient",
-        lambda *_: fulfillment,
+        lambda *_args, **_kwargs: fulfillment,
     )
 
-    message = {
-        "Body": json.dumps(
-            {
-                "event_id": "event-status-test",
-                "event_type": "OrderCreated",
-                "order_number": "ORD-TEST-001",
-            }
+    order_worker.process_message(
+        make_message()
+    )
+
+    fulfillment.create_fulfillment.assert_called_once_with(
+        order
+    )
+
+    assert order.status == "CONFIRMED"
+
+    db.add.assert_called_once()
+
+    processed_event = db.add.call_args.args[0]
+
+    assert processed_event.event_id == "event-123"
+    assert processed_event.event_type == "OrderCreated"
+
+    db.commit.assert_called_once()
+    db.close.assert_called_once()
+
+
+def test_fulfillment_failure_does_not_mark_processed(
+    monkeypatch,
+):
+    db = MagicMock()
+
+    order = make_order(status="PENDING")
+
+    db.scalar.side_effect = [
+        None,
+        order,
+    ]
+
+    monkeypatch.setattr(
+        order_worker,
+        "SessionLocal",
+        lambda: db,
+    )
+
+    fulfillment = MagicMock()
+
+    fulfillment.create_fulfillment.side_effect = (
+        RetryableFulfillmentError(
+            "temporary fulfillment failure"
         )
-    }
+    )
+
+    monkeypatch.setattr(
+        order_worker,
+        "FulfillmentClient",
+        lambda *_args, **_kwargs: fulfillment,
+    )
+
+    with pytest.raises(
+        RetryableFulfillmentError
+    ):
+        order_worker.process_message(
+            make_message()
+        )
+
+    db.add.assert_not_called()
+    db.commit.assert_not_called()
+    db.rollback.assert_called_once()
+    db.close.assert_called_once()
+
+
+def test_non_pending_order_does_not_call_fulfillment(
+    monkeypatch,
+):
+    db = MagicMock()
+
+    order = make_order(status="CONFIRMED")
+
+    # Event has not been processed before,
+    # but the order has already moved beyond PENDING.
+    db.scalar.side_effect = [
+        None,
+        order,
+    ]
+
+    monkeypatch.setattr(
+        order_worker,
+        "SessionLocal",
+        lambda: db,
+    )
+
+    fulfillment = MagicMock()
+
+    monkeypatch.setattr(
+        order_worker,
+        "FulfillmentClient",
+        lambda *_args, **_kwargs: fulfillment,
+    )
 
     with pytest.raises(
         order_worker.NonRetryableFulfillmentError
     ):
-        order_worker.process_message(message)
+        order_worker.process_message(
+            make_message(
+                event_id="event-status-test-001"
+            )
+        )
 
     fulfillment.create_fulfillment.assert_not_called()
-    db.rollback.assert_called()    
+    db.commit.assert_not_called()
+    db.rollback.assert_called_once()
+    db.close.assert_called_once()

@@ -5,6 +5,7 @@ import time
 
 import boto3
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.database import SessionLocal
 from app.integrations.fulfillment_client import (
@@ -12,8 +13,7 @@ from app.integrations.fulfillment_client import (
     NonRetryableFulfillmentError,
     RetryableFulfillmentError,
 )
-from app.models.models import ProcessedEvent
-from app.repositories.order_repository import get_order_by_id
+from app.models.models import Order, ProcessedEvent
 
 
 logging.basicConfig(
@@ -25,20 +25,47 @@ logger = logging.getLogger(__name__)
 
 QUEUE_URL = os.getenv("ORDER_QUEUE_URL")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+
 FULFILLMENT_API_URL = os.getenv(
     "FULFILLMENT_API_URL",
     "http://localhost:9000",
 )
 
+EXPECTED_EVENT_TYPE = "OrderCreated"
+FULFILLABLE_ORDER_STATUS = "PENDING"
+
+
+def select_order_by_number(order_number):
+    return select(Order).where(
+        Order.order_number == order_number
+    )
+
 
 def process_message(message):
-    event = json.loads(message["Body"])
+    """
+    Process one OrderCreated event.
+
+    Delivery semantics:
+    - SQS provides at-least-once delivery.
+    - ProcessedEvent provides durable duplicate detection.
+    - order_number is propagated to the fulfillment API as its
+      idempotency key by FulfillmentClient.
+    - Exactly-once execution is not claimed because PostgreSQL and
+      the external fulfillment service do not share one transaction.
+    """
+
+    try:
+        event = json.loads(message["Body"])
+    except (KeyError, json.JSONDecodeError) as exc:
+        raise NonRetryableFulfillmentError(
+            "Message body is not valid JSON"
+        ) from exc
 
     event_id = event.get("event_id")
     event_type = event.get("event_type")
     order_number = event.get("order_number")
 
-    if event_type != "OrderCreated":
+    if event_type != EXPECTED_EVENT_TYPE:
         raise NonRetryableFulfillmentError(
             f"Unsupported event type: {event_type}"
         )
@@ -56,7 +83,6 @@ def process_message(message):
     db = SessionLocal()
 
     try:
-        # Durable duplicate detection.
         already_processed = db.scalar(
             select(ProcessedEvent).where(
                 ProcessedEvent.event_id == event_id
@@ -65,8 +91,11 @@ def process_message(message):
 
         if already_processed:
             logger.info(
-                "duplicate_event_skipped event_id=%s",
+                "duplicate_event_skipped "
+                "event_id=%s "
+                "order_number=%s",
                 event_id,
+                order_number,
             )
             return
 
@@ -79,22 +108,60 @@ def process_message(message):
                 f"Order {order_number} does not exist"
             )
 
-        client = FulfillmentClient(FULFILLMENT_API_URL)
+        # Prevent stale or unexpected OrderCreated events from
+        # moving an order backwards in its lifecycle.
+        if order.status != FULFILLABLE_ORDER_STATUS:
+            raise NonRetryableFulfillmentError(
+                f"Order {order_number} cannot be fulfilled "
+                f"from status {order.status}"
+            )
 
-        client.create_fulfillment(order)
-
-        # The external service accepted fulfillment.
-        order.status = "CONFIRMED"
-
-        processed_event = ProcessedEvent(
-            event_id=event_id,
-            event_type=event_type,
+        client = FulfillmentClient(
+            FULFILLMENT_API_URL
         )
 
-        db.add(processed_event)
+        # This external side effect cannot participate in the
+        # PostgreSQL transaction. FulfillmentClient therefore sends
+        # order_number as the downstream Idempotency-Key.
+        client.create_fulfillment(order)
 
-        # Order state + processed marker commit together.
-        db.commit()
+        order.status = "CONFIRMED"
+
+        db.add(
+            ProcessedEvent(
+                event_id=event_id,
+                event_type=event_type,
+            )
+        )
+
+        try:
+            # Order state and durable processed marker commit
+            # atomically inside PostgreSQL.
+            db.commit()
+
+        except IntegrityError as exc:
+            db.rollback()
+
+            # Another worker may have committed the same event first.
+            # The downstream idempotency key is still required to
+            # protect the external fulfillment side effect.
+            duplicate = db.scalar(
+                select(ProcessedEvent).where(
+                    ProcessedEvent.event_id == event_id
+                )
+            )
+
+            if duplicate:
+                logger.warning(
+                    "concurrent_duplicate_event_detected "
+                    "event_id=%s "
+                    "order_number=%s",
+                    event_id,
+                    order_number,
+                )
+                return
+
+            raise exc
 
         logger.info(
             "order_fulfillment_confirmed "
@@ -112,14 +179,6 @@ def process_message(message):
 
     finally:
         db.close()
-
-
-def select_order_by_number(order_number):
-    from app.models.models import Order
-
-    return select(Order).where(
-        Order.order_number == order_number
-    )
 
 
 def run_worker():
@@ -144,7 +203,10 @@ def run_worker():
             VisibilityTimeout=30,
         )
 
-        messages = response.get("Messages", [])
+        messages = response.get(
+            "Messages",
+            [],
+        )
 
         for message in messages:
             try:
@@ -156,18 +218,27 @@ def run_worker():
                 )
 
             except RetryableFulfillmentError as exc:
+                # Do not delete.
+                # SQS will make the message visible again and the
+                # redrive policy eventually sends repeated failures
+                # to the DLQ.
                 logger.warning(
                     "retryable_fulfillment_failure error=%s",
                     str(exc),
                 )
 
             except NonRetryableFulfillmentError as exc:
+                # Intentionally leave the message undeleted so the
+                # configured SQS redrive policy captures poison
+                # messages in the DLQ for investigation.
                 logger.error(
                     "non_retryable_fulfillment_failure error=%s",
                     str(exc),
                 )
 
             except Exception:
+                # Unknown infrastructure/application failures are
+                # also retried through SQS redelivery.
                 logger.exception(
                     "unexpected_worker_failure"
                 )

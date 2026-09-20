@@ -2,7 +2,7 @@ from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 import pytest
-
+import json
 from app.integrations.fulfillment_client import RetryableFulfillmentError
 from app.models.models import Order, ProcessedEvent
 from app.workers.order_worker import process_message
@@ -132,3 +132,55 @@ def test_fulfillment_failure_does_not_mark_processed(
     db.add.assert_not_called()
     db.commit.assert_not_called()
     db.rollback.assert_called_once()
+
+
+def test_non_pending_order_does_not_call_fulfillment(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from app.workers import order_worker
+
+    order = MagicMock()
+    order.id = 1
+    order.order_number = "ORD-TEST-001"
+    order.status = "CONFIRMED"
+
+    db = MagicMock()
+
+    # First scalar(): ProcessedEvent lookup -> not processed
+    # Second scalar(): Order lookup -> existing CONFIRMED order
+    db.scalar.side_effect = [
+        None,
+        order,
+    ]
+
+    monkeypatch.setattr(
+        order_worker,
+        "SessionLocal",
+        lambda: db,
+    )
+
+    fulfillment = MagicMock()
+
+    monkeypatch.setattr(
+        order_worker,
+        "FulfillmentClient",
+        lambda *_: fulfillment,
+    )
+
+    message = {
+        "Body": json.dumps(
+            {
+                "event_id": "event-status-test",
+                "event_type": "OrderCreated",
+                "order_number": "ORD-TEST-001",
+            }
+        )
+    }
+
+    with pytest.raises(
+        order_worker.NonRetryableFulfillmentError
+    ):
+        order_worker.process_message(message)
+
+    fulfillment.create_fulfillment.assert_not_called()
+    db.rollback.assert_called()    

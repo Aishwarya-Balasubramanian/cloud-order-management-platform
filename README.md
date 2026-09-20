@@ -11,52 +11,52 @@ workflow rather than a CRUD-only API.
 ## Architecture
 
 ```text
-                            Client
-                              │
-                         HTTPS / JSON
-                              │
-                              ▼
-                     API Gateway / Load Balancer
-                              │
-                              ▼
-                     ┌──────────────────┐
-                     │     FastAPI      │
-                     │    JWT / RBAC    │
-                     └────────┬─────────┘
-                              │
-                    Service / Repository
-                              │
-                              ▼
-                 ┌──────────────────────────┐
-                 │      PostgreSQL / RDS    │
-                 │                          │
-                 │ Orders + OrderItems      │
-                 │ OutboxEvents             │
-                 │ ProcessedEvents          │
-                 └────────────┬─────────────┘
-                              │
-                              ▼
-                    ┌──────────────────┐
-                    │ Outbox Publisher │
-                    └────────┬─────────┘
-                             │
-                             ▼
-                        Amazon SQS
-                         │       │
-                         │       └────────→ DLQ
-                         ▼
+                         Client
+                           │
+                       HTTPS / JSON
+                           │
+                           ▼
+                 API Gateway / Load Balancer
+                           │
+                           ▼
+                  ┌──────────────────┐
+                  │     FastAPI      │
+                  │    JWT / RBAC    │
+                  └────────┬─────────┘
+                           │
+                  Service / Repository
+                           │
+                           ▼
+              ┌──────────────────────────┐
+              │     PostgreSQL / RDS     │
+              │                          │
+              │ Orders + OrderItems      │
+              │ OutboxEvents             │
+              │ ProcessedEvents          │
+              └────────────┬─────────────┘
+                           │
+                           ▼
+                  ┌──────────────────┐
+                  │ Outbox Publisher │
+                  └────────┬─────────┘
+                           │
+                           ▼
+                       Amazon SQS
+                        │       │
+                        │       └────────→ DLQ
+                        ▼
                     Order Worker
-                         │
+                        │
                     HTTP / JSON
-                         │
-                         ▼
+                        │
+                        ▼
                    Fulfillment API
 ```
 
 ## Engineering Goals
 
-The project focuses on several problems that appear in production backend and
-integration systems:
+The project focuses on engineering concerns that appear in production backend
+and integration systems:
 
 - API contract validation
 - business-rule enforcement
@@ -69,6 +69,7 @@ integration systems:
 - authentication and authorization
 - infrastructure isolation
 - observability and operational troubleshooting
+- automated application and infrastructure validation
 
 ## Technology Stack
 
@@ -86,9 +87,9 @@ integration systems:
 ### Messaging and Integration
 
 - Amazon SQS
-- Dead-letter queue
-- Transactional outbox
-- Persistent consumer idempotency
+- dead-letter queue
+- transactional outbox
+- persistent consumer idempotency
 - REST/JSON fulfillment integration
 
 ### Cloud and Infrastructure
@@ -98,7 +99,7 @@ integration systems:
 - Amazon SQS
 - Amazon ECR
 - AWS IAM
-- CloudWatch alarms
+- Amazon CloudWatch alarms
 - Terraform
 
 ### Runtime and Delivery
@@ -115,8 +116,8 @@ integration systems:
 Customer
    │
    └────< Order
-            │
-            └────< OrderItem >──── Product
+             │
+             └────< OrderItem >──── Product
 
 Order creation
    │
@@ -158,7 +159,7 @@ PATCH /api/v1/orders/{order_id}/status
 
 Order creation requires an authorized `order_writer` or `admin` role.
 
-Order status updates require `fulfillment_worker` or `admin`.
+Order status updates require a `fulfillment_worker` or `admin` role.
 
 ## Order Lifecycle
 
@@ -179,6 +180,10 @@ PENDING
 ```
 
 Invalid state transitions return HTTP `409 Conflict`.
+
+The asynchronous fulfillment worker also protects against stale
+`OrderCreated` events moving an order backwards in its lifecycle. Fulfillment
+is only initiated for an order in the expected `PENDING` state.
 
 ## Transactional Outbox
 
@@ -201,40 +206,59 @@ OrderItems
 OutboxEvent
 ```
 
-inside the same database transaction.
+inside the same PostgreSQL transaction.
 
-A separate publisher sends durable outbox events to SQS.
+A separate outbox publisher reads durable unpublished events and sends them to
+SQS.
 
-This ensures that event intent is not lost when the API process fails after the
-database commit.
+This prevents event intent from being lost if the API process fails after the
+database transaction commits.
 
 ## Delivery Semantics and Idempotency
 
-SQS is treated as an at-least-once delivery system.
+SQS is treated as an **at-least-once delivery system**.
 
 The project deliberately does not claim exactly-once distributed processing.
 
-Every order-created event contains a unique `event_id`.
+Every `OrderCreated` event contains a unique `event_id`. The worker checks the
+persistent `processed_events` table before executing fulfillment.
 
-The worker checks the persistent `processed_events` table before executing
-fulfillment.
-
-After successful fulfillment:
+After successful fulfillment, the application persists:
 
 ```text
 Order.status = CONFIRMED
-+
+        +
 ProcessedEvent(event_id)
-+
-database commit
+        +
+PostgreSQL commit
 ```
 
-The external fulfillment request also sends the order number as an idempotency
-key.
+The order-state change and processed-event marker therefore commit atomically
+inside PostgreSQL.
+
+The external fulfillment request also sends the order number as an
+idempotency key.
 
 This protects against common duplicate-delivery scenarios while acknowledging
-that end-to-end idempotency also requires the downstream service to honor the
-idempotency key.
+an important distributed-systems boundary:
+
+```text
+Fulfillment succeeds
+        ↓
+worker crashes before PostgreSQL commit
+        ↓
+SQS redelivers event
+        ↓
+fulfillment may be called again
+```
+
+PostgreSQL and an external REST service cannot participate in the same local
+database transaction. End-to-end duplicate protection therefore also requires
+the downstream fulfillment service to honor the supplied idempotency key
+durably.
+
+A unique `event_id` constraint additionally protects the persistent
+`ProcessedEvent` record from duplicate insertion.
 
 ## Failure Handling
 
@@ -251,9 +275,15 @@ Retryable examples include:
 - HTTP 503
 - HTTP 504
 
-Failed SQS messages are not acknowledged successfully and can be redelivered.
+Failed SQS messages are not acknowledged successfully and can therefore become
+visible again for redelivery.
 
-Messages exceeding the configured receive threshold are routed to the DLQ.
+The Terraform SQS configuration defines a redrive policy so messages exceeding
+the configured receive threshold can be routed to the DLQ.
+
+Malformed, unsupported, or otherwise non-processable events are also left
+unacknowledged so repeated failures can eventually be isolated in the DLQ for
+investigation.
 
 ## Database Migrations
 
@@ -268,12 +298,19 @@ SQLAlchemy model change
         ↓
 Alembic revision
         ↓
-Review generated migration
+Review migration
         ↓
 Apply migration
         ↓
 Regression tests
 ```
+
+The repository contains migrations for the baseline order schema,
+transactional outbox, and persistent processed-event tracking.
+
+Docker Compose runs migrations before starting the API.
+
+A Kubernetes migration Job is also provided as a deployment artifact.
 
 ## Security
 
@@ -289,11 +326,12 @@ Implemented application controls include:
 - security-group isolation
 
 The Terraform database security group accepts PostgreSQL traffic from the
-application security group rather than the entire VPC.
+application security group rather than exposing the database broadly.
 
-For a production identity system, the shared-secret JWT implementation would
-typically be replaced by an external identity provider using OIDC/JWKS and
-asymmetric token verification.
+The current JWT implementation uses HS256 for the portfolio/local runtime.
+
+For a production identity architecture, this would typically be replaced by an
+external identity provider using OIDC/JWKS and asymmetric token verification.
 
 ## Health and Observability
 
@@ -311,8 +349,8 @@ Confirms that the application process is alive.
 GET /ready
 ```
 
-Executes a PostgreSQL connectivity check and returns HTTP 503 when the database
-is unavailable.
+Executes a PostgreSQL connectivity check and returns HTTP `503` when the
+database is unavailable.
 
 Application logging includes:
 
@@ -324,17 +362,20 @@ Application logging includes:
 - worker failures
 - outbox publication failures
 
-Terraform also defines alarms for:
+Terraform defines CloudWatch alarms for:
 
 - messages visible in the DLQ
 - age of the oldest SQS message
 - sustained high RDS CPU utilization
 
+The alarm definitions are infrastructure artifacts and are not represented as
+currently active in a live AWS environment.
+
 ## Testing
 
-The automated test suite covers:
+The automated test suite currently contains **13 passing tests** covering:
 
-- customer validation
+- customer/business validation
 - server-authoritative pricing
 - valid order lifecycle transitions
 - invalid lifecycle transitions
@@ -344,6 +385,29 @@ The automated test suite covers:
 - duplicate event suppression
 - successful processed-event recording
 - retryable fulfillment failure behavior
+- prevention of fulfillment from an invalid order state
+- API/PostgreSQL integration behavior
+
+The PostgreSQL integration test exercises:
+
+```text
+HTTP request
+      ↓
+FastAPI
+      ↓
+Pydantic validation
+      ↓
+JWT / RBAC
+      ↓
+Service / Repository
+      ↓
+SQLAlchemy
+      ↓
+PostgreSQL
+```
+
+It also verifies that order creation persists both the order and its
+transactional outbox event.
 
 Run:
 
@@ -386,46 +450,75 @@ Run the API:
 python -m uvicorn app.main:app --reload
 ```
 
-Swagger/OpenAPI documentation is available through FastAPI while the application
-is running.
+FastAPI exposes interactive Swagger/OpenAPI documentation while the
+application is running.
 
 ## Docker
 
 The repository contains a Dockerfile and Docker Compose configuration.
 
-Basic local stack:
+Start the local application stack:
 
 ```powershell
-docker compose up
+docker compose up --build
 ```
 
+The Compose startup sequence is:
+
+```text
+PostgreSQL
+     ↓
+health check
+     ↓
+Alembic migrations
+     ↓
+FastAPI
+```
+
+The Docker Compose development stack has been validated locally with:
+
+- PostgreSQL 17
+- Alembic migrations
+- API startup
+- `/health` liveness check
+- `/ready` PostgreSQL readiness check
+- PostgreSQL-backed API integration testing
+
 The optional asynchronous profile starts the outbox publisher and order worker
-when an SQS queue is configured:
+when an SQS queue and fulfillment endpoint are configured:
 
 ```powershell
 docker compose --profile async up
 ```
 
-Docker execution has not been validated in every development environment and
-requires Docker Engine/Desktop to be installed.
+The asynchronous workers are not represented as having been exercised against
+live AWS SQS in this portfolio environment.
 
 ## Kubernetes
 
 The `k8s/` directory contains manifests for:
 
-- API deployment
-- API service
-- order worker
-- outbox publisher
-- shared configuration
+- API Deployment
+- API Service
+- order-worker Deployment
+- outbox-publisher Deployment
+- shared ConfigMap
+- Alembic database migration Job
 
-The API and worker can scale independently.
+The API and worker are designed to scale independently.
 
 The outbox publisher intentionally uses one replica because the current
-implementation does not yet implement multi-publisher database row claiming.
+implementation does not implement multi-publisher database row claiming.
 
 For multiple publisher replicas, a future version should introduce safe
-claiming semantics such as `SELECT ... FOR UPDATE SKIP LOCKED`.
+claiming semantics such as:
+
+```sql
+SELECT ... FOR UPDATE SKIP LOCKED
+```
+
+The Kubernetes files are deployment artifacts. They have **not** been deployed
+to a live Kubernetes or EKS cluster in this portfolio environment.
 
 ## AWS / Terraform
 
@@ -434,37 +527,59 @@ Terraform definitions include:
 - VPC
 - private database subnets
 - application and database security groups
-- RDS PostgreSQL
+- Amazon RDS for PostgreSQL
 - SQS order queue
-- dead-letter queue
-- ECR repository
+- SQS dead-letter queue
+- Amazon ECR repository
 - IAM policy
 - CloudWatch alarms
 
 RDS master credentials use AWS-managed password handling.
 
+Terraform configuration is automatically formatted and validated in GitHub
+Actions.
+
 The infrastructure definitions are provided as reproducible architecture
-artifacts. This repository does not claim that all AWS resources or an EKS
-cluster are currently deployed.
+artifacts. This repository does not claim that the AWS resources or an EKS
+cluster are currently provisioned.
 
 ## CI
 
-GitHub Actions performs:
+GitHub Actions validates the project on pushes and pull requests to `main`.
 
 ```text
 Checkout
    ↓
-Python setup
+Start PostgreSQL 17 service
+   ↓
+Python 3.13 setup
    ↓
 Dependency installation
    ↓
-pytest
+Alembic migrations
+   ↓
+13-test automated suite
    ↓
 Docker image build
+   ↓
+Terraform format check
+   ↓
+Terraform initialization
+   ↓
+Terraform validation
 ```
 
-Automatic production deployment is intentionally not enabled without an AWS
-OIDC/deployment configuration.
+The pipeline has been executed successfully in GitHub Actions.
+
+This provides independent validation of database migrations, application tests,
+container image construction, and Terraform configuration outside the local
+development environment.
+
+Automatic production deployment is intentionally not enabled.
+
+A production deployment would require an appropriately configured deployment
+identity, such as GitHub OIDC, together with the target AWS runtime
+infrastructure.
 
 ## Architecture Decisions
 
@@ -496,25 +611,56 @@ for investigation procedures covering:
 - schema changes
 - secret exposure
 
+## Validation Status
+
+Demonstrated locally and/or through GitHub Actions:
+
+- FastAPI application startup
+- PostgreSQL persistence
+- Alembic schema migrations
+- Docker image construction
+- Docker Compose application/database startup
+- liveness and readiness checks
+- 13-test automated suite
+- PostgreSQL-backed API integration test
+- Terraform initialization and validation
+- GitHub Actions CI execution
+
+Implemented as architecture/deployment artifacts but not exercised against a
+live cloud runtime:
+
+- Amazon SQS / DLQ
+- Amazon RDS
+- Amazon ECR
+- CloudWatch alarms
+- Kubernetes deployments
+- Kubernetes migration Job
+- EKS deployment
+
+This distinction is intentional: the repository separates implemented and
+validated behavior from infrastructure that has been designed but not
+provisioned.
+
 ## Known Limitations and Production Evolution
 
 The project intentionally documents rather than hides its current boundaries.
 
 Potential production evolution includes:
 
-- OIDC/JWKS identity provider integration
+- OIDC/JWKS identity-provider integration
 - structured JSON logging
 - distributed tracing
 - application-level metrics and dashboards
 - notification routing for CloudWatch alarms
-- PostgreSQL integration/contract tests in CI
-- multi-replica outbox publisher with safe row claiming
+- multi-replica outbox publishing with safe row claiming
 - retention/cleanup policies for processed events and outbox history
 - full EKS cluster provisioning
+- workload IAM integration such as IRSA
 - AWS OIDC-based CI/CD deployment
 - autoscaling policies
 - rate limiting
-- pagination/filtering for collection endpoints
+- pagination and filtering for collection endpoints
+- deeper database concurrency and load testing
 
-These are treated as explicit architectural evolution points rather than
-features that are falsely represented as already implemented.
+These are explicit architectural evolution points rather than features
+represented as already implemented.
